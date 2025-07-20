@@ -36,7 +36,7 @@
  * as events with the same transaction.
  *
  * The supported requests are \c register , \c unregister , \c call ,
- * \progress , \c accept , \c decline , \c info , \c message , \c dtmf_info ,
+ * \c progress , \c accept , \c decline , \c info , \c message , \c dtmf_info ,
  * \c subscribe , \c unsubscribe , \c transfer , \c recording , \c keyframe ,
  * \c hold , \c unhold , \c update and \c hangup . \c register can be used,
  * as the name suggests, to register a username at a SIP registrar to
@@ -85,7 +85,8 @@
 		"reason" : "<SIP error reason>",
 		"reason_header" : "<Reason header text; optional>",
 		"reason_header_protocol" : "<Reason header protocol; optional>",
-		"reason_header_cause" : "<Reason header cause code; optional>"
+		"reason_header_cause" : "<Reason header cause code; optional>",
+		"headers" : "<object with key/value strings; custom headers extracted from SIP event based on incoming_header_prefix defined in register request; optional>"
 	}
 }
 \endverbatim
@@ -115,6 +116,7 @@
 	"force_tcp" : <true|false; if true, forces TCP for the SIP messaging; optional>,
 	"sips" : <true|false; if true, configures a SIPS URI too when registering; optional>,
 	"rfc2543_cancel" : <true|false; if true, configures sip client to CANCEL pending INVITEs without having received a provisional response first; optional>,
+	"automatic_ringing" : <true|false; if false, don't generate ringing automatically as soon as an INVITE; optional>,
 	"username" : "<SIP URI to register; mandatory>",
 	"secret" : "<password to use to register; optional>",
 	"ha1_secret" : "<prehashed password to use to register; optional>",
@@ -808,6 +810,7 @@ static struct janus_json_parameter register_parameters[] = {
 	{"force_tcp", JANUS_JSON_BOOL, 0},
 	{"sips", JANUS_JSON_BOOL, 0},
 	{"rfc2543_cancel", JANUS_JSON_BOOL, 0},
+	{"automatic_ringing", JANUS_JSON_BOOL, 0},
 	{"username", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
 	{"secret", JSON_STRING, 0},
 	{"ha1_secret", JSON_STRING, 0},
@@ -1047,6 +1050,7 @@ typedef struct janus_sip_account {
 	gboolean force_tcp;
 	gboolean sips;
 	gboolean rfc2543_cancel;
+	gboolean automatic_ringing;
 	char *username;
 	char *display_name;		/* Used for outgoing calls in the From header */
 	char *authuser;			/**< username to use for authentication */
@@ -1141,6 +1145,7 @@ typedef struct janus_sip_session {
 	char *hangup_reason_header_protocol;
 	char *hangup_reason_header_cause;
 	GList *incoming_header_prefixes;
+	json_t *hangup_custom_headers;
 	GList *active_calls;
 	janus_refcount ref;
 	janus_sip_dtmf latest_dtmf;
@@ -1297,6 +1302,10 @@ static void janus_sip_session_free(const janus_refcount *session_ref) {
 	if(session->incoming_header_prefixes) {
 		g_list_free_full(session->incoming_header_prefixes, g_free);
 		session->incoming_header_prefixes = NULL;
+	}
+	if(session->hangup_custom_headers) {
+		json_decref(session->hangup_custom_headers);
+		session->hangup_custom_headers = NULL;
 	}
 	janus_sip_srtp_cleanup(session);
 	janus_mutex_destroy(&session->mutex);
@@ -2323,6 +2332,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->account.force_tcp = FALSE;
 	session->account.sips = FALSE;
 	session->account.rfc2543_cancel = FALSE;
+	session->account.automatic_ringing = TRUE;
 	session->account.username = NULL;
 	session->account.display_name = NULL;
 	session->account.user_agent = NULL;
@@ -2342,6 +2352,7 @@ void janus_sip_create_session(janus_plugin_session *handle, int *error) {
 	session->hangup_reason_header = NULL;
 	session->hangup_reason_header_protocol = NULL;
 	session->hangup_reason_header_cause = NULL;
+	session->hangup_custom_headers = NULL;
 	session->media.remote_audio_ip = NULL;
 	session->media.remote_video_ip = NULL;
 	session->media.earlymedia = FALSE;
@@ -3133,6 +3144,11 @@ static void *janus_sip_handler(void *data) {
 			if(do_rfc2543_cancel != NULL) {
 				rfc2543_cancel = json_is_true(do_rfc2543_cancel);
 			}
+			gboolean automatic_ringing = TRUE;
+			json_t *do_automatic_ringing = json_object_get(root, "automatic_ringing");
+			if(do_automatic_ringing != NULL) {
+				automatic_ringing = json_is_true(do_automatic_ringing);
+			}
 
 			/* Parse addresses */
 			json_t *proxy = json_object_get(root, "proxy");
@@ -3290,6 +3306,7 @@ static void *janus_sip_handler(void *data) {
 				session->account.force_tcp = FALSE;
 				session->account.sips = FALSE;
 				session->account.rfc2543_cancel = FALSE;
+				session->account.automatic_ringing = TRUE;
 				if(session->account.username != NULL)
 					g_free(session->account.username);
 				session->account.username = NULL;
@@ -3322,6 +3339,7 @@ static void *janus_sip_handler(void *data) {
 			session->account.force_tcp = force_tcp;
 			session->account.sips = sips;
 			session->account.rfc2543_cancel = rfc2543_cancel;
+			session->account.automatic_ringing = automatic_ringing;
 			session->account.username = g_strdup(user_id);
 			session->account.authuser = g_strdup(authuser_text ? authuser_text : user_id);
 			session->account.secret = secret_text ? g_strdup(secret_text) : NULL;
@@ -4947,6 +4965,14 @@ static void *janus_sip_handler(void *data) {
 			/* Notify the operation */
 			result = json_object();
 			json_object_set_new(result, "event", json_string("infosent"));
+		} else if(!strcasecmp(request_text, "send_ringing")) {
+			if(session->status != janus_sip_call_status_invited && session->status != janus_sip_call_status_progress) {
+				JANUS_LOG(LOG_ERR, "Wrong state (not invited or progress? status=%s)\n", janus_sip_call_status_string(session->status));
+				g_snprintf(error_cause, 512, "Wrong state (not in a call?)");
+				goto error;
+			}
+			if(session->stack->s_nh_i)
+				nua_respond(session->stack->s_nh_i, 180, sip_status_phrase(180), TAG_END());
 		} else if(!strcasecmp(request_text, "message")) {
 			/* Send a SIP MESSAGE request: we'll only need the content and optional payload type */
 			JANUS_VALIDATE_JSON_OBJECT(root, sipmessage_parameters,
@@ -5308,6 +5334,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 					json_object_set_new(calling, "reason_header_protocol", json_string(session->hangup_reason_header_protocol));
 				if(session->hangup_reason_header_cause)
 					json_object_set_new(calling, "reason_header_cause", json_string(session->hangup_reason_header_cause));
+				if(session->hangup_custom_headers) {
+					json_t *custom_headers_copy = json_deep_copy(session->hangup_custom_headers);
+					json_object_set_new(calling, "headers", custom_headers_copy);
+				}
 				json_object_set_new(call, "result", calling);
 				json_object_set_new(call, "call_id", json_string(session->callid));
 				int ret = gateway->push_event(session->handle, &janus_sip_plugin, session->transaction, call, NULL);
@@ -5328,6 +5358,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 						json_object_set_new(info, "reason_header_protocol", json_string(session->hangup_reason_header_protocol));
 					if(session->hangup_reason_header_cause)
 						json_object_set_new(info, "reason_header_cause", json_string(session->hangup_reason_header_cause));
+					if(session->hangup_custom_headers) {
+						json_t *custom_headers_notify_copy = json_deep_copy(session->hangup_custom_headers);
+						json_object_set_new(info, "headers", custom_headers_notify_copy);
+					}
 					gateway->notify_event(&janus_sip_plugin, session->handle, info);
 				}
 				/* Get rid of any PeerConnection that may have been set up */
@@ -5354,6 +5388,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 				session->hangup_reason_header = NULL;
 				session->hangup_reason_header_protocol = NULL;
 				session->hangup_reason_header_cause = NULL;
+				if(session->hangup_custom_headers) {
+					json_decref(session->hangup_custom_headers);
+					session->hangup_custom_headers = NULL;
+				}
 				if(g_atomic_int_get(&session->establishing) || g_atomic_int_get(&session->established)) {
 					/* Get rid of the PeerConnection in the core */
 					gateway->close_pc(session->handle);
@@ -5644,8 +5682,10 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			su_free(session->stack->s_home, callee_text);
 			g_free(referred_by);
 			if(!reinvite) {
-				/* Send a Ringing back */
-				nua_respond(nh, 180, sip_status_phrase(180), TAG_END());
+				if(session->account.automatic_ringing) {
+					/* Send a Ringing back */
+					nua_respond(nh, 180, sip_status_phrase(180), TAG_END());
+				}
 				session->stack->s_nh_i = nh;
 			}
 			break;
@@ -6404,6 +6444,7 @@ auth_failed:
 				session->account.force_tcp = FALSE;
 				session->account.sips = FALSE;
 				session->account.rfc2543_cancel = FALSE;
+				session->account.automatic_ringing = TRUE;
 				if(session->account.username != NULL)
 					g_free(session->account.username);
 				session->account.username = NULL;
@@ -6580,6 +6621,13 @@ void janus_sip_save_reason(sip_t const *sip, janus_sip_session *session) {
 	if(sip->sip_reason && sip->sip_reason->re_cause) {
 		g_free(session->hangup_reason_header_cause);
 		session->hangup_reason_header_cause = g_strdup(sip->sip_reason->re_cause);
+	}
+	if(session->incoming_header_prefixes) {
+		if(session->hangup_custom_headers) {
+			json_decref(session->hangup_custom_headers);
+		}
+		json_t *headers = janus_sip_get_incoming_headers(sip, session);
+		session->hangup_custom_headers = headers;
 	}
 }
 
